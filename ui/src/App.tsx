@@ -39,6 +39,7 @@ function App() {
   const [debugPanelHeight, setDebugPanelHeight] = useState(288) // Default height
   const [assistantOpen, setAssistantOpen] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [isSpecCreating, setIsSpecCreating] = useState(false)
 
   const queryClient = useQueryClient()
   const { data: projects, isLoading: projectsLoading } = useProjects()
@@ -100,8 +101,8 @@ function App() {
         setShowExpandProject(true)
       }
 
-      // A : Toggle assistant panel (when project selected)
-      if ((e.key === 'a' || e.key === 'A') && selectedProject) {
+      // A : Toggle assistant panel (when project selected and not in spec creation)
+      if ((e.key === 'a' || e.key === 'A') && selectedProject && !isSpecCreating) {
         e.preventDefault()
         setAssistantOpen(prev => !prev)
       }
@@ -132,7 +133,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [selectedProject, showAddFeature, showExpandProject, selectedFeature, debugOpen, assistantOpen, features, showSettings])
+  }, [selectedProject, showAddFeature, showExpandProject, selectedFeature, debugOpen, assistantOpen, features, showSettings, isSpecCreating])
 
   // Combine WebSocket progress with feature data
   const progress = wsState.progress.total > 0 ? wsState.progress : {
@@ -167,6 +168,7 @@ function App() {
                 selectedProject={selectedProject}
                 onSelectProject={handleSelectProject}
                 isLoading={projectsLoading}
+                onSpecCreatingChange={setIsSpecCreating}
               />
 
               {selectedProject && (
@@ -290,8 +292,8 @@ function App() {
         />
       )}
 
-      {/* Assistant FAB and Panel - hide FAB when expand modal is open */}
-      {selectedProject && !showExpandProject && (
+      {/* Assistant FAB and Panel - hide when expand modal or spec creation is open */}
+      {selectedProject && !showExpandProject && !isSpecCreating && (
         <>
           <AssistantFAB
             onClick={() => setAssistantOpen(!assistantOpen)}

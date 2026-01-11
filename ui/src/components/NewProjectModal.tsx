@@ -25,12 +25,14 @@ interface NewProjectModalProps {
   isOpen: boolean
   onClose: () => void
   onProjectCreated: (projectName: string) => void
+  onStepChange?: (step: Step) => void
 }
 
 export function NewProjectModal({
   isOpen,
   onClose,
   onProjectCreated,
+  onStepChange,
 }: NewProjectModalProps) {
   const [step, setStep] = useState<Step>('name')
   const [projectName, setProjectName] = useState('')
@@ -45,6 +47,12 @@ export function NewProjectModal({
   void _specMethod
 
   const createProject = useCreateProject()
+
+  // Wrapper to notify parent of step changes
+  const changeStep = (newStep: Step) => {
+    setStep(newStep)
+    onStepChange?.(newStep)
+  }
 
   if (!isOpen) return null
 
@@ -63,18 +71,18 @@ export function NewProjectModal({
     }
 
     setError(null)
-    setStep('folder')
+    changeStep('folder')
   }
 
   const handleFolderSelect = (path: string) => {
     // Append project name to the selected path
     const fullPath = path.endsWith('/') ? `${path}${projectName.trim()}` : `${path}/${projectName.trim()}`
     setProjectPath(fullPath)
-    setStep('method')
+    changeStep('method')
   }
 
   const handleFolderCancel = () => {
-    setStep('name')
+    changeStep('name')
   }
 
   const handleMethodSelect = async (method: SpecMethod) => {
@@ -82,7 +90,7 @@ export function NewProjectModal({
 
     if (!projectPath) {
       setError('Please select a project folder first')
-      setStep('folder')
+      changeStep('folder')
       return
     }
 
@@ -94,7 +102,7 @@ export function NewProjectModal({
           path: projectPath,
           specMethod: 'manual',
         })
-        setStep('complete')
+        changeStep('complete')
         setTimeout(() => {
           onProjectCreated(project.name)
           handleClose()
@@ -110,7 +118,7 @@ export function NewProjectModal({
           path: projectPath,
           specMethod: 'claude',
         })
-        setStep('chat')
+        changeStep('chat')
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : 'Failed to create project')
       }
@@ -125,7 +133,7 @@ export function NewProjectModal({
     try {
       await startAgent(projectName.trim(), yoloMode)
       // Success - navigate to project
-      setStep('complete')
+      changeStep('complete')
       setTimeout(() => {
         onProjectCreated(projectName.trim())
         handleClose()
@@ -144,7 +152,7 @@ export function NewProjectModal({
 
   const handleChatCancel = () => {
     // Go back to method selection but keep the project
-    setStep('method')
+    changeStep('method')
     setSpecMethod(null)
   }
 
@@ -155,7 +163,7 @@ export function NewProjectModal({
   }
 
   const handleClose = () => {
-    setStep('name')
+    changeStep('name')
     setProjectName('')
     setProjectPath(null)
     setSpecMethod(null)
@@ -168,10 +176,10 @@ export function NewProjectModal({
 
   const handleBack = () => {
     if (step === 'method') {
-      setStep('folder')
+      changeStep('folder')
       setSpecMethod(null)
     } else if (step === 'folder') {
-      setStep('name')
+      changeStep('name')
       setProjectPath(null)
     }
   }

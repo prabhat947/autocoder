@@ -264,9 +264,10 @@ class AssistantChatSession:
             if value:
                 sdk_env[var] = value
 
-        # Determine model from environment or use default
+        # Determine model from environment or use registry default
         # This allows using alternative APIs (e.g., GLM via z.ai) that may not support Claude model names
-        model = os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-5-20251101")
+        from registry import DEFAULT_MODEL
+        model = os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL", DEFAULT_MODEL)
 
         try:
             logger.info("Creating ClaudeSDKClient...")

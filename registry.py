@@ -30,8 +30,7 @@ logger = logging.getLogger(__name__)
 # Available models with display names
 # To add a new model: add an entry here with {"id": "model-id", "name": "Display Name"}
 AVAILABLE_MODELS = [
-    {"id": "claude-opus-4-6-20260201", "name": "Claude Opus 4.6"},
-    {"id": "claude-sonnet-4-6-20260201", "name": "Claude Sonnet 4.6"},
+    {"id": "claude-opus-4-6", "name": "Claude Opus 4.6"},
     {"id": "claude-opus-4-5-20251101", "name": "Claude Opus 4.5"},
     {"id": "claude-sonnet-4-5-20250929", "name": "Claude Sonnet 4.5"},
 ]
@@ -45,7 +44,7 @@ VALID_MODELS = [m["id"] for m in AVAILABLE_MODELS]
 _env_default_model = os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL")
 if _env_default_model is not None:
     _env_default_model = _env_default_model.strip()
-DEFAULT_MODEL = _env_default_model or "claude-opus-4-6-20260201"
+DEFAULT_MODEL = _env_default_model or "claude-opus-4-6"
 
 # Ensure env-provided DEFAULT_MODEL is in VALID_MODELS for validation consistency
 # (idempotent: only adds if missing, doesn't alter AVAILABLE_MODELS semantics)

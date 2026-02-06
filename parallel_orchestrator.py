@@ -36,7 +36,7 @@ from sqlalchemy import text
 from api.database import Feature, create_database
 from api.dependency_resolver import are_dependencies_satisfied, compute_scheduling_scores
 from progress import has_features
-from server.utils.process_utils import kill_process_tree
+from server.utils.process_utils import JobProcess, kill_process_tree, spawn_with_job
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,7 @@ class ParallelOrchestrator:
         testing_agent_ratio: int = 1,
         testing_batch_size: int = DEFAULT_TESTING_BATCH_SIZE,
         batch_size: int = 3,
+        playwright_headless: bool | None = None,
         on_output: Callable[[int, str], None] | None = None,
         on_status: Callable[[int, str], None] | None = None,
     ):
@@ -180,17 +181,23 @@ class ParallelOrchestrator:
         self.testing_agent_ratio = min(max(testing_agent_ratio, 0), 3)  # Clamp 0-3
         self.testing_batch_size = min(max(testing_batch_size, 1), 5)  # Clamp 1-5
         self.batch_size = min(max(batch_size, 1), 3)  # Clamp 1-3
+        # Read from environment if not explicitly passed (process_manager sets this)
+        if playwright_headless is None:
+            env_val = os.environ.get("PLAYWRIGHT_HEADLESS", "true").lower()
+            self.playwright_headless = env_val in ("true", "1", "yes", "on")
+        else:
+            self.playwright_headless = playwright_headless
         self.on_output = on_output
         self.on_status = on_status
 
         # Thread-safe state
         self._lock = threading.Lock()
-        # Coding agents: feature_id -> process
+        # Coding agents: feature_id -> JobProcess (with Job Object for reliable cleanup)
         # Safe to key by feature_id because start_feature() checks for duplicates before spawning
-        self.running_coding_agents: dict[int, subprocess.Popen] = {}
-        # Testing agents: pid -> (feature_id, process)
+        self.running_coding_agents: dict[int, JobProcess] = {}
+        # Testing agents: pid -> (feature_id, JobProcess)
         # Keyed by PID (not feature_id) because multiple agents can test the same feature
-        self.running_testing_agents: dict[int, tuple[int, subprocess.Popen]] = {}
+        self.running_testing_agents: dict[int, tuple[int, JobProcess]] = {}
         # Legacy alias for backward compatibility
         self.running_agents = self.running_coding_agents
         self.abort_events: dict[int, threading.Event] = {}
@@ -835,7 +842,8 @@ class ParallelOrchestrator:
             cmd.append("--yolo")
 
         try:
-            # CREATE_NO_WINDOW on Windows prevents console window pop-ups
+            # Use spawn_with_job for Windows Job Object support
+            # This ensures MCP servers and other grandchildren are killed on cleanup
             # stdin=DEVNULL prevents blocking on stdin reads
             # encoding="utf-8" and errors="replace" fix Windows CP1252 issues
             popen_kwargs: dict[str, Any] = {
@@ -846,12 +854,15 @@ class ParallelOrchestrator:
                 "encoding": "utf-8",
                 "errors": "replace",
                 "cwd": str(AUTOCODER_ROOT),  # Run from autocoder root for proper imports
-                "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+                "env": {
+                    **os.environ,
+                    "PYTHONUNBUFFERED": "1",
+                    "PLAYWRIGHT_HEADLESS": str(self.playwright_headless).lower(),
+                },
             }
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            # Note: spawn_with_job handles CREATE_NO_WINDOW internally on Windows
 
-            proc = subprocess.Popen(cmd, **popen_kwargs)
+            job_proc = spawn_with_job(cmd, **popen_kwargs)
         except Exception as e:
             # Reset in_progress on failure
             session = self.get_session()
@@ -865,13 +876,13 @@ class ParallelOrchestrator:
             return False, f"Failed to start agent: {e}"
 
         with self._lock:
-            self.running_coding_agents[feature_id] = proc
+            self.running_coding_agents[feature_id] = job_proc
             self.abort_events[feature_id] = abort_event
 
-        # Start output reader thread
+        # Start output reader thread (pass the underlying Popen object)
         threading.Thread(
             target=self._read_output,
-            args=(feature_id, proc, abort_event, "coding"),
+            args=(feature_id, job_proc.proc, abort_event, "coding"),
             daemon=True
         ).start()
 
@@ -901,6 +912,7 @@ class ParallelOrchestrator:
             cmd.append("--yolo")
 
         try:
+            # Use spawn_with_job for Windows Job Object support (batch agent)
             popen_kwargs: dict[str, Any] = {
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
@@ -909,12 +921,15 @@ class ParallelOrchestrator:
                 "encoding": "utf-8",
                 "errors": "replace",
                 "cwd": str(AUTOCODER_ROOT),
-                "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+                "env": {
+                    **os.environ,
+                    "PYTHONUNBUFFERED": "1",
+                    "PLAYWRIGHT_HEADLESS": str(self.playwright_headless).lower(),
+                },
             }
-            if sys.platform == "win32":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            # Note: spawn_with_job handles CREATE_NO_WINDOW internally on Windows
 
-            proc = subprocess.Popen(cmd, **popen_kwargs)
+            job_proc = spawn_with_job(cmd, **popen_kwargs)
         except Exception as e:
             # Reset in_progress on failure
             session = self.get_session()
@@ -929,16 +944,16 @@ class ParallelOrchestrator:
             return False, f"Failed to start batch agent: {e}"
 
         with self._lock:
-            self.running_coding_agents[primary_id] = proc
+            self.running_coding_agents[primary_id] = job_proc
             self.abort_events[primary_id] = abort_event
             self._batch_features[primary_id] = list(feature_ids)
             for fid in feature_ids:
                 self._feature_to_primary[fid] = primary_id
 
-        # Start output reader thread
+        # Start output reader thread (pass the underlying Popen object)
         threading.Thread(
             target=self._read_output,
-            args=(primary_id, proc, abort_event, "coding"),
+            args=(primary_id, job_proc.proc, abort_event, "coding"),
             daemon=True
         ).start()
 
@@ -1002,7 +1017,7 @@ class ParallelOrchestrator:
                 cmd.extend(["--model", self.model])
 
             try:
-                # CREATE_NO_WINDOW on Windows prevents console window pop-ups
+                # Use spawn_with_job for Windows Job Object support (testing agent)
                 # stdin=DEVNULL prevents blocking on stdin reads
                 # encoding="utf-8" and errors="replace" fix Windows CP1252 issues
                 popen_kwargs: dict[str, Any] = {
@@ -1013,31 +1028,35 @@ class ParallelOrchestrator:
                     "encoding": "utf-8",
                     "errors": "replace",
                     "cwd": str(AUTOCODER_ROOT),
-                    "env": {**os.environ, "PYTHONUNBUFFERED": "1"},
+                    "env": {
+                        **os.environ,
+                        "PYTHONUNBUFFERED": "1",
+                        "PLAYWRIGHT_HEADLESS": str(self.playwright_headless).lower(),
+                    },
                 }
-                if sys.platform == "win32":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                # Note: spawn_with_job handles CREATE_NO_WINDOW internally on Windows
 
-                proc = subprocess.Popen(cmd, **popen_kwargs)
+                job_proc = spawn_with_job(cmd, **popen_kwargs)
             except Exception as e:
                 debug_log.log("TESTING", f"FAILED to spawn testing agent: {e}")
                 return False, f"Failed to start testing agent: {e}"
 
             # Register process by PID (not feature_id) to avoid overwrites
             # when multiple agents test the same feature
-            self.running_testing_agents[proc.pid] = (primary_feature_id, proc)
+            self.running_testing_agents[job_proc.proc.pid] = (primary_feature_id, job_proc)
             testing_count = len(self.running_testing_agents)
 
         # Start output reader thread with primary feature ID for log attribution
+        # (pass the underlying Popen object)
         threading.Thread(
             target=self._read_output,
-            args=(primary_feature_id, proc, threading.Event(), "testing"),
+            args=(primary_feature_id, job_proc.proc, threading.Event(), "testing"),
             daemon=True
         ).start()
 
-        print(f"Started testing agent for features [{batch_str}] (PID {proc.pid})", flush=True)
+        print(f"Started testing agent for features [{batch_str}] (PID {job_proc.proc.pid})", flush=True)
         debug_log.log("TESTING", f"Successfully spawned testing agent for batch [{batch_str}]",
-            pid=proc.pid,
+            pid=job_proc.proc.pid,
             feature_ids=batch,
             total_testing_agents=testing_count)
         return True, f"Started testing agent for features [{batch_str}]"
@@ -1313,15 +1332,17 @@ class ParallelOrchestrator:
                 return False, "Feature not running"
 
             abort = self.abort_events.get(primary_id)
-            proc = self.running_coding_agents.get(primary_id)
+            job_proc = self.running_coding_agents.get(primary_id)
 
         if abort:
             abort.set()
-        if proc:
-            result = kill_process_tree(proc, timeout=5.0)
+        if job_proc:
+            # Use JobProcess.kill_tree() for reliable cleanup via Job Object
+            result = job_proc.kill_tree(timeout=5.0)
             debug_log.log("STOP", f"Killed feature {feature_id} (primary {primary_id}) process tree",
                 status=result.status, children_found=result.children_found,
-                children_terminated=result.children_terminated, children_killed=result.children_killed)
+                children_terminated=result.children_terminated, children_killed=result.children_killed,
+                job_closed=result.job_closed)
 
         return True, f"Stopped feature {feature_id}"
 
@@ -1340,11 +1361,13 @@ class ParallelOrchestrator:
         with self._lock:
             testing_items = list(self.running_testing_agents.items())
 
-        for pid, (feature_id, proc) in testing_items:
-            result = kill_process_tree(proc, timeout=5.0)
+        for pid, (feature_id, job_proc) in testing_items:
+            # Use JobProcess.kill_tree() for reliable cleanup via Job Object
+            result = job_proc.kill_tree(timeout=5.0)
             debug_log.log("STOP", f"Killed testing agent for feature #{feature_id} (PID {pid})",
                 status=result.status, children_found=result.children_found,
-                children_terminated=result.children_terminated, children_killed=result.children_killed)
+                children_terminated=result.children_terminated, children_killed=result.children_killed,
+                job_closed=result.job_closed)
 
         # Clear dict so get_status() doesn't report stale agents while
         # _on_agent_complete callbacks are still in flight.
@@ -1651,6 +1674,7 @@ async def run_parallel_orchestrator(
     testing_agent_ratio: int = 1,
     testing_batch_size: int = DEFAULT_TESTING_BATCH_SIZE,
     batch_size: int = 3,
+    playwright_headless: bool | None = None,
 ) -> None:
     """Run the unified orchestrator.
 
@@ -1662,6 +1686,7 @@ async def run_parallel_orchestrator(
         testing_agent_ratio: Number of regression agents to maintain (0-3)
         testing_batch_size: Number of features per testing batch (1-5)
         batch_size: Max features per coding agent batch (1-3)
+        playwright_headless: Whether to run Playwright browser in headless mode (None = read from PLAYWRIGHT_HEADLESS env)
     """
     print(f"[ORCHESTRATOR] run_parallel_orchestrator called with max_concurrency={max_concurrency}", flush=True)
     orchestrator = ParallelOrchestrator(
@@ -1672,6 +1697,7 @@ async def run_parallel_orchestrator(
         testing_agent_ratio=testing_agent_ratio,
         testing_batch_size=testing_batch_size,
         batch_size=batch_size,
+        playwright_headless=playwright_headless,
     )
 
     # Set up cleanup to run on exit (handles normal exit, exceptions)
